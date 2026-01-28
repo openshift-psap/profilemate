@@ -1416,22 +1416,74 @@ def install_import_hook():
 
 
 # ============================================================================
+# Activation Guard - Only activate for vLLM processes
+# ============================================================================
+
+def should_activate_profiling():
+    """Determine if profiling should be activated for this process"""
+
+    # Method 1: Explicit environment variable (highest priority)
+    explicit_enable = os.getenv("VLLM_ENABLE_PROFILING")
+    if explicit_enable is not None:
+        if explicit_enable == "1":
+            return True
+        else:
+            return False
+
+    # Method 2: Auto-detect vLLM usage
+    # Check command line arguments
+    import sys
+    cmdline = ' '.join(sys.argv)
+
+    # Check if this looks like a vLLM process
+    vllm_indicators = [
+        'vllm.entrypoints',
+        'vllm.engine',
+        'vllm',
+        '--model',  # Common vLLM argument
+    ]
+
+    for indicator in vllm_indicators:
+        if indicator in cmdline:
+            return True
+
+    # Method 3: Check if vLLM is installed (but don't activate yet)
+    # This prevents false positives for non-vLLM scripts
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('vllm')
+        if spec is None:
+            return False
+    except ImportError:
+        return False
+
+    # If vLLM is installed but not clearly in use, don't activate
+    # (Prevents profiling unrelated Python scripts)
+    return False
+
+
+# ============================================================================
 # Initialization
 # ============================================================================
 
-# Install the import hook immediately
-install_import_hook()
+# Only activate if this is a vLLM process
+if should_activate_profiling():
+    # Install the import hook
+    install_import_hook()
 
-print(f"\n[sitecustomize] vLLM Comprehensive Instrumentation Loaded", file=sys.stderr)
-print(f"  Session ID: {_session_id}", file=sys.stderr)
-print(f"  Output directory: {_session_dir}", file=sys.stderr)
-print(f"  CUDA graph tracking: {ProfilingConfig.ENABLE_CUDA_GRAPH_TRACKING}", file=sys.stderr)
-print(f"  KV cache tracking: {ProfilingConfig.ENABLE_KV_CACHE_TRACKING}", file=sys.stderr)
-print(f"  MoE expert tracking: {ProfilingConfig.ENABLE_MOE_EXPERT_TRACKING}", file=sys.stderr)
-print(f"  Forward pass timing: {ProfilingConfig.ENABLE_FORWARD_PASS_TIMING}", file=sys.stderr)
-print(f"  CPU operation timing: {ProfilingConfig.ENABLE_CPU_TIMING}", file=sys.stderr)
-print(f"  Batch utilization tracking: {ProfilingConfig.ENABLE_BATCH_UTILIZATION_TRACKING}", file=sys.stderr)
-print(f"  Preemption tracking: {ProfilingConfig.ENABLE_PREEMPTION_TRACKING}", file=sys.stderr)
-print(f"  Encoder-decoder timing: {ProfilingConfig.ENABLE_ENCODER_DECODER_TIMING}", file=sys.stderr)
-print(f"  CUDA Events mode: {ProfilingConfig.USE_CUDA_EVENTS} (batch size: {ProfilingConfig.CUDA_EVENT_BATCH_SIZE})", file=sys.stderr)
-print("", file=sys.stderr)
+    print(f"\n[sitecustomize] vLLM Comprehensive Instrumentation Loaded", file=sys.stderr)
+    print(f"  Session ID: {_session_id}", file=sys.stderr)
+    print(f"  Output directory: {_session_dir}", file=sys.stderr)
+    print(f"  CUDA graph tracking: {ProfilingConfig.ENABLE_CUDA_GRAPH_TRACKING}", file=sys.stderr)
+    print(f"  KV cache tracking: {ProfilingConfig.ENABLE_KV_CACHE_TRACKING}", file=sys.stderr)
+    print(f"  MoE expert tracking: {ProfilingConfig.ENABLE_MOE_EXPERT_TRACKING}", file=sys.stderr)
+    print(f"  Forward pass timing: {ProfilingConfig.ENABLE_FORWARD_PASS_TIMING}", file=sys.stderr)
+    print(f"  CPU operation timing: {ProfilingConfig.ENABLE_CPU_TIMING}", file=sys.stderr)
+    print(f"  Batch utilization tracking: {ProfilingConfig.ENABLE_BATCH_UTILIZATION_TRACKING}", file=sys.stderr)
+    print(f"  Preemption tracking: {ProfilingConfig.ENABLE_PREEMPTION_TRACKING}", file=sys.stderr)
+    print(f"  Encoder-decoder timing: {ProfilingConfig.ENABLE_ENCODER_DECODER_TIMING}", file=sys.stderr)
+    print(f"  CUDA Events mode: {ProfilingConfig.USE_CUDA_EVENTS} (batch size: {ProfilingConfig.CUDA_EVENT_BATCH_SIZE})", file=sys.stderr)
+    print("", file=sys.stderr)
+else:
+    # Silent mode - don't activate profiling for non-vLLM processes
+    pass

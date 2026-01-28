@@ -125,9 +125,31 @@ After running, you'll find:
 
 ## Configuration
 
+### Activation Control
+
+**NEW:** ProfileMate automatically detects vLLM processes and **only activates for vLLM**, not other Python scripts!
+
+```bash
+# Auto-detection (default) - activates only for vLLM
+export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+python -m vllm.entrypoints.openai.api_server --model gpt2  # ✅ Profiling ON
+python my_script.py                                         # ✅ Profiling OFF
+
+# Force enable for all Python processes
+export VLLM_ENABLE_PROFILING=1
+
+# Force disable even for vLLM
+export VLLM_ENABLE_PROFILING=0
+```
+
+See **[Activation Control Guide](docs/ACTIVATION_CONTROL.md)** for details.
+
 ### Environment Variables
 
 ```bash
+# Activation control
+export VLLM_ENABLE_PROFILING=1  # Force enable (default: auto-detect)
+
 # Change output location (default: /tmp/vllm_profiling)
 export VLLM_PROFILING_DIR="/custom/path"
 
@@ -578,6 +600,11 @@ for _, row in kv_cache.iterrows():
 
 ### Quick Start Guides
 
+- **[Activation Control Guide](docs/ACTIVATION_CONTROL.md)** - **NEW!** Smart activation for vLLM processes only:
+  - Auto-detection: Only activates for vLLM, not other Python scripts
+  - Explicit control with `VLLM_ENABLE_PROFILING` environment variable
+  - Zero overhead for non-vLLM processes
+  - Session-specific enable/disable options
 - **[New Profilers Guide](docs/NEW_PROFILERS_GUIDE.md)** - **NEW!** Complete guide for the 5 new profilers:
   - ForwardPassProfiler: Accurate GPU timing with CUDA Events
   - CPUTimingProfiler: CPU operation breakdown
