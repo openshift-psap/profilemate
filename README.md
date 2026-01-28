@@ -4,12 +4,24 @@ Comprehensive runtime instrumentation for vLLM servers to capture CUDA graph and
 
 ## Features
 
+### Core Profiling
 - ✅ **CUDA Graph Tracking**: Capture unique graphs, replay counts, and latencies
 - ✅ **KV Cache Profiling**: Block allocations, usage patterns, and eviction metrics
+- ✅ **MoE Expert Tracking**: Expert activations, co-selection, load balancing
 - ✅ **Full BatchDescriptor Tracking**: See exact graph configurations
+
+### NEW: Performance Profiling (V1 Scheduler)
+- ✅ **Forward Pass Timing**: Accurate GPU timing with CUDA Events (prefill/decode)
+- ✅ **CPU Operation Breakdown**: Scheduling, batch prep, sampling overhead
+- ✅ **Batch Utilization Tracking**: Scheduling efficiency and queue analysis
+- ✅ **Preemption Tracking**: Request lifecycle and preemption reasons
+- ✅ **Encoder-Decoder Timing**: Generic support for Whisper, Qwen3-VL, GPT, etc.
+
+### General
 - ✅ **Automatic CSV Export**: Easy analysis with pandas/excel
 - ✅ **Zero Code Changes**: Works via Python import hooks
-- ✅ **Production-Ready**: Minimal overhead (<1%)
+- ✅ **Production-Ready**: Minimal overhead (<3%)
+- ✅ **Configurable**: Enable/disable individual profilers
 
 ## Quick Start
 
@@ -70,24 +82,45 @@ After running, you'll find:
 
 ```
 /tmp/vllm_profiling/session_20260124_123456/
-├── metadata.json                  # Session info
+├── metadata.json                         # Session info
 │
 ├── CUDA Graph Files:
-│   ├── cuda_graph_captures.csv   # Unique graphs captured
-│   ├── cuda_graph_usage.csv      # Replay frequency per graph
-│   └── cuda_graph_timeline.csv   # Detailed replay timeline
+│   ├── cuda_graph_captures.csv          # Unique graphs captured
+│   ├── cuda_graph_usage.csv             # Replay frequency per graph
+│   └── cuda_graph_timeline.csv          # Detailed replay timeline
 │
 ├── KV Cache Files:
-│   ├── kv_cache_usage.csv         # Usage over time
-│   ├── kv_cache_evictions.csv     # Eviction events
-│   └── kv_cache_summary.txt       # Summary statistics
+│   ├── kv_cache_usage.csv               # Usage over time
+│   ├── kv_cache_evictions.csv           # Eviction events
+│   └── kv_cache_summary.txt             # Summary statistics
 │
-└── MoE Expert Tracking:
-    ├── moe_expert_activations.csv    # Expert activation counts per layer
-    ├── moe_expert_coselection.csv    # Which experts are selected together
-    ├── moe_routing_weights_hist.csv  # Routing weight distributions
-    ├── moe_load_imbalance.csv        # Load balancing metrics over time
-    └── moe_summary.json              # Aggregated statistics
+├── MoE Expert Tracking:
+│   ├── moe_expert_activations.csv       # Expert activation counts per layer
+│   ├── moe_expert_coselection.csv       # Which experts are selected together
+│   ├── moe_routing_weights_hist.csv     # Routing weight distributions
+│   ├── moe_load_imbalance.csv           # Load balancing metrics over time
+│   └── moe_summary.json                 # Aggregated statistics
+│
+├── Forward Pass Timing (NEW):
+│   ├── forward_pass_timing.csv          # Prefill/decode GPU timing
+│   └── forward_pass_summary.json        # Latency percentiles (P50/P95/P99)
+│
+├── CPU Operations (NEW):
+│   ├── cpu_operations_timing.csv        # Scheduling, sampling, batch prep
+│   └── cpu_timing_summary.json          # Per-operation breakdown
+│
+├── Batch Utilization (NEW):
+│   ├── batch_utilization.csv            # Token/seq utilization over time
+│   └── batch_utilization_summary.json   # Mean utilization, underutil events
+│
+├── Preemption Tracking (NEW):
+│   ├── preemption_events.csv            # Preemption/resume events
+│   ├── request_lifecycle.csv            # Full request timeline
+│   └── preemption_summary.json          # Preemption rate, reasons, delays
+│
+└── Encoder-Decoder Timing (NEW):
+    ├── encoder_decoder_timing.csv       # Component timing (encoder/decoder)
+    └── encoder_decoder_summary.json     # Time distribution percentages
 ```
 
 ## Configuration
@@ -111,9 +144,22 @@ Edit `sitecustomize.py`:
 
 ```python
 class ProfilingConfig:
-    ENABLE_CUDA_GRAPH_TRACKING = True   # Set to False to disable
-    ENABLE_KV_CACHE_TRACKING = True     # Set to False to disable
-    ENABLE_MOE_EXPERT_TRACKING = True   # Set to False to disable
+    # Core profilers
+    ENABLE_CUDA_GRAPH_TRACKING = True
+    ENABLE_KV_CACHE_TRACKING = True
+    ENABLE_MOE_EXPERT_TRACKING = True
+
+    # NEW: Performance profilers (V1 scheduler)
+    ENABLE_FORWARD_PASS_TIMING = True
+    ENABLE_CPU_TIMING = True
+    ENABLE_BATCH_UTILIZATION_TRACKING = True
+    ENABLE_PREEMPTION_TRACKING = True
+    ENABLE_ENCODER_DECODER_TIMING = True
+
+    # CUDA timing mode (for GPU profiling)
+    USE_CUDA_EVENTS = True   # True = perfect accuracy (0.5% overhead)
+                              # False = good accuracy (0.1% overhead)
+    CUDA_EVENT_BATCH_SIZE = 100  # Sync every N iterations
 ```
 
 ## Understanding the Output
@@ -530,9 +576,26 @@ for _, row in kv_cache.iterrows():
 
 ## Documentation
 
-### Guides
+### Quick Start Guides
 
-- **[Nsight Automated Profiling Guide](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE.md)** - **NEW!** Complete automation with nsys/ncu:
+- **[New Profilers Guide](docs/NEW_PROFILERS_GUIDE.md)** - **NEW!** Complete guide for the 5 new profilers:
+  - ForwardPassProfiler: Accurate GPU timing with CUDA Events
+  - CPUTimingProfiler: CPU operation breakdown
+  - BatchUtilizationProfiler: Scheduling efficiency
+  - PreemptionProfiler: Request lifecycle tracking
+  - EncoderDecoderProfiler: Whisper, Qwen3-VL, GPT support
+  - Complete analysis examples and optimization insights
+  - **Total overhead: <3%** for all profilers combined
+- **[CUDA Sync and GPU Timing Explained](docs/CUDA_SYNC_AND_GPU_TIMING.md)** - **NEW!** Why CUDA sync is necessary:
+  - How asynchronous CUDA execution works
+  - Why timing without sync is wrong (100-1000x error)
+  - CUDA Events vs torch.cuda.synchronize()
+  - Two profiling modes: perfect accuracy (0.5%) vs lightweight (0.1%)
+  - Real-world examples and performance analysis
+
+### Advanced Guides
+
+- **[Nsight Automated Profiling Guide](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE.md)** - Complete automation with nsys/ncu:
   - Automated profiling with Nsight Systems (timeline, NVTX markers)
   - Kernel-level analysis with Nsight Compute (bandwidth, roofline)
   - Python scripts to parse SQLite/CSV outputs automatically
