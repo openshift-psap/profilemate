@@ -1238,7 +1238,13 @@ def patch_gpu_model_runner():
 def patch_scheduler():
     """Patch Scheduler to track batch utilization and preemptions"""
     try:
-        from vllm.v1.core.scheduler import Scheduler
+        # Try new path first (vLLM 0.14.1+)
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler
+        except ImportError:
+            # Fallback to old path
+            from vllm.v1.core.scheduler import Scheduler
+
         from vllm.logger import init_logger
 
         logger = init_logger(__name__)
@@ -1373,13 +1379,15 @@ def install_import_hook():
 
         def find_module(self, fullname, path=None):
             # Trigger on specific vLLM modules
+            # Updated for vLLM 0.14.1+ compatibility
             target_modules = [
                 'vllm.compilation.cuda_graph',
                 'vllm.v1.core.kv_cache_manager',
                 'vllm.v1.core.block_pool',
                 'vllm.model_executor.layers.fused_moe.layer',
                 'vllm.v1.worker.gpu_model_runner',
-                'vllm.v1.core.scheduler',
+                'vllm.v1.core.sched.scheduler',  # 0.14.1: was vllm.v1.core.scheduler
+                'vllm.v1.core.scheduler',         # Older versions compatibility
             ]
 
             if fullname in target_modules:
@@ -1406,7 +1414,8 @@ def install_import_hook():
                 patch_fused_moe()
             elif fullname == 'vllm.v1.worker.gpu_model_runner':
                 patch_gpu_model_runner()
-            elif fullname == 'vllm.v1.core.scheduler':
+            elif fullname in ['vllm.v1.core.scheduler', 'vllm.v1.core.sched.scheduler']:
+                # Support both old and new scheduler paths
                 patch_scheduler()
 
             return module
