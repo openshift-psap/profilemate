@@ -460,6 +460,468 @@ print(f"Bandwidth: {baseline['bandwidth']:.1f} → {test['bandwidth']:.1f} GB/s 
 
 ---
 
+## 7. MoE Expert Tracking and MFU Metrics Reliability
+
+### Can we track expert activation in MoE models?
+
+**Partial built-in support**, but custom tracking recommended for detailed analysis.
+
+#### Built-in Option: EPLB Load Metrics
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-MoE-72B \
+    --tensor-parallel-size 4 \
+    --enable-eplb \
+    --eplb-config '{"log_balancedness": true}'
+```
+
+**Output:**
+```
+[EPLB] Balancedness: 0.85 (avg tokens per expert ÷ max tokens per expert)
+```
+
+**What it tracks:**
+- ✓ Load balancing metric (aggregate)
+- ✗ Per-expert activation counts
+- ✗ Router weight distribution
+- ✗ Expert selection patterns
+
+**Code location**: `vllm/vllm/distributed/eplb/eplb_state.py:118-138`
+
+#### Custom Tracking: sitecustomize.py (Recommended)
+
+**Add to profilemate/sitecustomize.py**:
+
+```python
+class MoEExpertProfiler:
+    """Tracks MoE expert activation patterns."""
+
+    def record_expert_selection(self, layer_idx, topk_ids, topk_weights):
+        # Count expert activations
+        for expert_id in topk_ids.flatten().tolist():
+            self.expert_activations[layer_idx][expert_id] += 1
+
+        # Track co-selection patterns
+        if topk_ids.size(1) == 2:
+            for pair in topk_ids.tolist():
+                key = f"{min(pair)},{max(pair)}"
+                self.co_selection_patterns[key] += 1
+```
+
+**Outputs:**
+- `moe_expert_activations.csv` - Per-expert activation counts
+- `moe_expert_coselection.csv` - Which experts are selected together
+- `moe_routing_weights_hist.csv` - Distribution of routing weights
+
+**See**: [MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md](docs/MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md) for full implementation.
+
+### How reliable are MFU metrics?
+
+**MFU metrics are ANALYTICAL (calculated), not measured.**
+
+#### How They Work
+
+```
+1. Parse model config → Extract dimensions (layers, heads, etc.)
+2. Track scheduler output → Get num_tokens, context_len
+3. Calculate FLOPs → Use analytical formulas
+4. Calculate bandwidth → Model weight reads, KV cache access
+5. Divide by time → Get TF/s and GB/s
+```
+
+**Code location**: `vllm/vllm/v1/metrics/perf.py`
+
+#### Reliability by Model Type
+
+| Model Type | FLOPs Accuracy | Bandwidth Accuracy | Notes |
+|------------|----------------|-------------------|-------|
+| **Dense (Llama, Qwen)** | **>95%** | **~90%** | Highly reliable |
+| **MoE (balanced)** | **~90%** | **~85%** | Good if load is balanced |
+| **MoE (skewed)** | **~70-90%** | **~70-85%** | Depends on expert imbalance |
+| **Prefill phase** | **>95%** | **~90%** | Large matmuls are predictable |
+| **Decode phase** | **~90%** | **~80-85%** | Cache effects hard to model |
+
+#### Key Assumptions (May Not Hold)
+
+**From `vllm/v1/metrics/perf.py:776-777`:**
+
+```python
+# FIXME: Assume perfect load balancing for now.
+num_activated_experts = min(num_activated_tokens, num_experts)
+```
+
+**Reality**: Expert load is often skewed:
+- Top 10% experts: 40% of tokens
+- Middle 50%: 50% of tokens
+- Bottom 40%: 10% of tokens
+
+**Impact**: If load is skewed, MFU metrics can be 10-30% off.
+
+#### What MFU Metrics DO NOT Include
+
+❌ **Kernel efficiency** (assumes 100% theoretical peak)
+❌ **Scheduling overhead** (CPU-GPU sync, kernel launches)
+❌ **Communication costs** (TP all-reduce, EP all-to-all)
+❌ **Cache effects** (hot vs cold experts)
+
+#### Verification Methods
+
+**Method 1: Compare with Nsight Compute**
+
+```bash
+ncu --set full -o profile.ncu-rep <vllm command>
+```
+
+**Typical deltas**:
+- Compute (FLOPs): ±5-10%
+- Memory bandwidth: ±10-15%
+
+**Method 2: Roofline Analysis**
+
+```python
+arithmetic_intensity = total_flops / total_bytes
+
+# A100: Ridge point = 312 TF/s / 2000 GB/s = 156 FLOPs/byte
+# If your AI > 156 → Compute-bound (FLOPs metrics accurate)
+# If your AI < 156 → Memory-bound (Bandwidth metrics more important)
+```
+
+#### When to Trust MFU Metrics
+
+✅ **Highly reliable for:**
+- Relative comparisons (comparing runs)
+- Dense transformer models
+- Identifying compute vs memory bottlenecks
+- Capacity planning
+
+⚠️ **Less reliable for:**
+- Absolute performance claims
+- MoE models with skewed expert usage
+- Quantized models (hardware has specialized units)
+
+❌ **Not accurate for:**
+- Attention-variant architectures (sliding window, sparse, MLA)
+- Models with custom kernels
+
+#### Example: MoE Load Skew Impact
+
+```python
+# Scenario: Qwen2.5-MoE-72B with 64 experts, top-2 routing
+
+# Theoretical (uniform): Each expert gets 2/64 = 3.125% of tokens
+# Reality (from profiling):
+#   - Top 10 experts: 5% each = 50% total
+#   - Next 20 experts: 2% each = 40% total
+#   - Bottom 34 experts: 0.3% each = 10% total
+
+# Impact on MFU:
+# - FLOPs: Still accurate (same total compute)
+# - Bandwidth: Hot experts cached → 10-20% faster than analytical
+# - Load balance: EPLB balancedness = 0.62 (vs 1.0 perfect)
+```
+
+#### Recommendations
+
+**For production**:
+```bash
+# Monitor both MFU metrics AND expert load balance
+python -m vllm.entrypoints.openai.api_server \
+    --model <moe-model> \
+    --enable-mfu-metrics \
+    --enable-eplb \
+    --eplb-config '{"log_balancedness": true}'
+```
+
+**For deep analysis**:
+```bash
+# Use sitecustomize for per-expert tracking
+export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+export VLLM_DEBUG_MFU_METRICS=1
+
+python -m vllm.entrypoints.openai.api_server \
+    --model <moe-model> \
+    --enable-mfu-metrics
+```
+
+**Cross-check with Nsight**:
+```bash
+ncu --set full --target-processes all \
+    -o verify.ncu-rep \
+    <vllm command>
+```
+
+**See**: [MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md](docs/MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md) for complete details.
+
+---
+
+---
+
+## 8. Automated Profiling with nsys and ncu
+
+### How can we automate profiling and extract all breakdowns?
+
+**Answer**: Complete automation pipeline with scripts provided!
+
+### Quick Start: All-in-One Script
+
+```bash
+# Quick profiling (nsys only, ~5 min)
+./profilemate/scripts/profile_vllm.sh \
+    --model meta-llama/Llama-2-7b-hf \
+    --mode quick
+
+# Full profiling (nsys + ncu, ~60 min)
+./profilemate/scripts/profile_vllm.sh \
+    --model meta-llama/Llama-2-7b-hf \
+    --mode full \
+    --with-ncu
+
+# MoE-specific profiling
+./profilemate/scripts/profile_vllm.sh \
+    --model Qwen/Qwen2.5-MoE-72B \
+    --mode moe
+```
+
+**Outputs**:
+- ✅ Nsys timeline analysis (prefill/decode, components)
+- ✅ NCU kernel analysis (bandwidth, roofline)
+- ✅ Parsed CSV files (automatically extracted)
+- ✅ Comprehensive HTML report with recommendations
+- ✅ MoE expert tracking (if mode=moe)
+
+### What Gets Extracted Automatically
+
+**From Nsight Systems** (`parse_nsys_profile.py`):
+```python
+# Prefill vs Decode breakdown
+prefill_decode = {
+    'prefill': {'count': 10, 'total_ms': 1234.5, 'avg_ms': 123.45},
+    'decode': {'count': 50, 'total_ms': 567.8, 'avg_ms': 11.36}
+}
+
+# Component breakdown
+components = {
+    'attention': {'total_ms': 456.7, 'percent': 45.2},
+    'ffn': {'total_ms': 345.6, 'percent': 34.2},
+    'moe': {'total_ms': 123.4, 'percent': 12.2}
+}
+
+# Top kernels by time
+top_kernels = [
+    {'kernel_name': 'flash_attention_v2', 'total_time_ms': 234.5, ...},
+    {'kernel_name': 'gemm_fp16', 'total_time_ms': 123.4, ...}
+]
+
+# CUDA graph coverage
+cuda_graphs = {
+    'total_kernel_launches': 5000,
+    'graph_kernel_launches': 4500,
+    'graph_coverage_pct': 90.0
+}
+```
+
+**From Nsight Compute** (`parse_ncu_profile.py`):
+```python
+# Per-kernel bandwidth
+bandwidth_metrics = [
+    {
+        'kernel_name': 'flash_attention_v2',
+        'bandwidth_gbps': 892.1,
+        'dram_throughput_pct': 85.2,
+        'sm_throughput_pct': 45.3,
+        'bottleneck': 'memory'  # or 'compute'
+    },
+    ...
+]
+
+# Roofline data
+roofline_data = [
+    {
+        'kernel_name': 'gemm_fp16',
+        'sm_utilization': 92.1,
+        'memory_utilization': 43.5,
+        'bottleneck': 'compute'
+    },
+    ...
+]
+```
+
+### Manual Step-by-Step (If Needed)
+
+#### Step 1: Nsight Systems Profiling
+
+```bash
+# Run nsys with NVTX markers
+export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+
+nsys profile \
+    --trace=cuda,nvtx \
+    --cuda-graph-trace=node \
+    --delay=30 --duration=60 \
+    --output=vllm_profile \
+    --export=sqlite \
+    python -m vllm.entrypoints.openai.api_server \
+        --model meta-llama/Llama-2-7b-hf
+```
+
+#### Step 2: Parse nsys SQLite
+
+```bash
+python ./profilemate/scripts/parse_nsys_profile.py \
+    vllm_profile.sqlite \
+    --output-dir ./results
+```
+
+**Outputs**:
+- `./results/nvtx_ranges.csv` - All NVTX markers with timings
+- `./results/kernel_stats.csv` - Per-kernel statistics
+- `./results/summary.json` - Aggregated metrics
+
+#### Step 3: Nsight Compute (Optional)
+
+```bash
+# Profile specific kernels
+ncu --set full \
+    --kernel-name regex:"attention|gemm|moe" \
+    --launch-skip 100 --launch-count 50 \
+    --output=vllm_kernels \
+    --csv \
+    python -m vllm.entrypoints.openai.api_server ...
+
+# Export to CSV
+ncu --csv --page raw vllm_kernels.ncu-rep > vllm_kernels.csv
+
+# Parse
+python ./profilemate/scripts/parse_ncu_profile.py \
+    vllm_kernels.csv \
+    --output-dir ./ncu_results
+```
+
+#### Step 4: Generate HTML Report
+
+```bash
+python ./profilemate/scripts/generate_profile_report.py \
+    --nsys-results ./results \
+    --ncu-results ./ncu_results \
+    --output report.html
+```
+
+**Report includes**:
+- Executive summary with key metrics
+- Prefill/decode breakdown table
+- Component time breakdown
+- Top kernels by time
+- Bandwidth analysis with bottleneck identification
+- Performance recommendations
+
+### Integration with Existing Tools
+
+**Combine with sitecustomize profiling**:
+
+```bash
+# Enable all profiling layers
+export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+
+# Run with all metrics
+./profilemate/scripts/profile_vllm.sh \
+    --model <model> \
+    --mode full \
+    --with-ncu
+
+# Results include:
+# - sitecustomize data: /tmp/vllm_profiling/session_*/
+# - nsys data: ./profiling_results/parsed/
+# - ncu data: ./profiling_results/ncu_parsed/
+# - Combined report: ./profiling_results/profile_report.html
+```
+
+### CI/CD Integration
+
+**Automated regression detection**:
+
+```bash
+# Run baseline profiling
+./profilemate/scripts/profile_vllm.sh --model <model> --mode quick
+cp ./profiling_results_*/parsed/summary.json baseline_profile.json
+
+# After changes, compare
+./profilemate/scripts/profile_vllm.sh --model <model> --mode quick
+python ./profilemate/scripts/check_regression.py \
+    --current ./profiling_results_*/parsed/summary.json \
+    --baseline baseline_profile.json \
+    --threshold 10  # 10% regression threshold
+
+# Exit code 1 if regressions detected
+```
+
+### Key Scripts Provided
+
+| Script | Purpose | Time |
+|--------|---------|------|
+| `profile_vllm.sh` | All-in-one automation | 5-60 min |
+| `nsys_quick_profile.sh` | Quick nsys profiling | ~5 min |
+| `ncu_detailed_profile.sh` | Detailed kernel analysis | ~30-60 min |
+| `parse_nsys_profile.py` | Extract nsys metrics | <1 min |
+| `parse_ncu_profile.py` | Extract ncu metrics | <1 min |
+| `generate_profile_report.py` | HTML report generator | <1 min |
+| `check_regression.py` | Compare vs baseline | <1 min |
+| `send_test_requests.py` | Send test traffic | Variable |
+
+### Example Output Structure
+
+```
+profiling_results_20260127_123456/
+├── vllm_quick_profile.nsys-rep         # View: nsys-ui file.nsys-rep
+├── vllm_quick_profile.sqlite           # Parsed automatically
+├── vllm_ncu_profile.ncu-rep            # View: ncu-ui file.ncu-rep
+├── vllm_ncu_profile.csv                # Parsed automatically
+├── parsed/                             # nsys results
+│   ├── nvtx_ranges.csv                 # All NVTX markers
+│   ├── kernel_stats.csv                # Per-kernel stats
+│   ├── memcpy_stats.csv                # Memory transfers
+│   └── summary.json                    # Aggregated metrics
+├── ncu_parsed/                         # ncu results
+│   ├── kernel_bandwidth_metrics.csv    # Bandwidth per kernel
+│   ├── roofline_data.csv               # Roofline analysis
+│   └── ncu_summary.json                # Aggregated metrics
+├── moe_expert_tracking/                # MoE results (if mode=moe)
+│   ├── moe_expert_activations.csv
+│   ├── moe_expert_coselection.csv
+│   └── moe_routing_weights_hist.csv
+└── profile_report.html                 # Open in browser
+```
+
+### Quick Analysis Examples
+
+**Find prefill/decode split**:
+```bash
+cat ./profiling_results_*/parsed/summary.json | \
+    python -c "import sys, json; d=json.load(sys.stdin); \
+    print(f\"Prefill: {d['prefill_decode']['prefill']['total_ms']:.1f}ms\"); \
+    print(f\"Decode: {d['prefill_decode']['decode']['total_ms']:.1f}ms\")"
+```
+
+**Find top time-consuming component**:
+```bash
+cat ./profiling_results_*/parsed/summary.json | \
+    python -c "import sys, json; d=json.load(sys.stdin); \
+    comps=sorted(d['components'].items(), key=lambda x: x[1]['total_ms'], reverse=True); \
+    print(f\"Top component: {comps[0][0]} ({comps[0][1]['percent']:.1f}%)\")"
+```
+
+**Check CUDA graph coverage**:
+```bash
+cat ./profiling_results_*/parsed/summary.json | \
+    python -c "import sys, json; d=json.load(sys.stdin); \
+    print(f\"CUDA graph coverage: {d['cuda_graphs']['graph_coverage_pct']:.1f}%\")"
+```
+
+**See**: [NSIGHT_AUTOMATED_PROFILING_GUIDE.md](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE.md) for complete details.
+
+---
+
 ## Summary: Production Profiling Setup
 
 ### Recommended Command

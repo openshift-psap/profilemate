@@ -13,27 +13,56 @@ Comprehensive runtime instrumentation for vLLM servers to capture CUDA graph and
 
 ## Quick Start
 
-### 1. Installation
+### Option 1: Automated Profiling with nsys/ncu (Recommended)
+
+**Complete automation with performance report**:
+
+```bash
+cd profilemate
+
+# Quick profiling (~5 min)
+./scripts/profile_vllm.sh --model meta-llama/Llama-2-7b-hf --mode quick
+
+# Open HTML report
+xdg-open ./profiling_results_*/profile_report.html
+```
+
+**Outputs**:
+- ✅ Prefill/decode breakup
+- ✅ Attention vs FFN vs MoE timing
+- ✅ Kernel-level bandwidth analysis
+- ✅ CUDA graph coverage
+- ✅ Performance recommendations
+
+**Modes**:
+- `--mode quick`: nsys profiling only (~5 min)
+- `--mode full --with-ncu`: nsys + ncu (~60 min)
+- `--mode moe`: MoE expert tracking
+
+See: [Nsight Automated Profiling Guide](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE.md)
+
+### Option 2: Runtime Instrumentation (sitecustomize)
+
+**Continuous monitoring with minimal overhead**:
 
 ```bash
 cd profilemate
 export PYTHONPATH="$(pwd):$PYTHONPATH"
-```
 
-### 2. Run vLLM with Profiling
-
-```bash
 python -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
     --tensor-parallel-size 4 \
     --port 9999
-```
 
-### 3. Check Results
-
-```bash
+# Check results
 ls /tmp/vllm_profiling/session_*/
 ```
+
+**Outputs**:
+- CUDA graph captures/replays
+- KV cache usage over time
+- Block eviction patterns
+- (Optional) MoE expert activations
 
 ## Output Files
 
@@ -366,13 +395,28 @@ for _, row in kv_cache.iterrows():
 
 ### Guides
 
-- **[Advanced Profiling Guide](docs/ADVANCED_PROFILING_GUIDE.md)** - **NEW!** Comprehensive guide covering:
+- **[Nsight Automated Profiling Guide](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE.md)** - **NEW!** Complete automation with nsys/ncu:
+  - Automated profiling with Nsight Systems (timeline, NVTX markers)
+  - Kernel-level analysis with Nsight Compute (bandwidth, roofline)
+  - Python scripts to parse SQLite/CSV outputs automatically
+  - Prefill/decode breakup extraction
+  - Component timing (attention vs FFN vs MoE)
+  - All-in-one automation script: `./scripts/profile_vllm.sh`
+  - HTML report generation with performance recommendations
+  - [Part 2: Integration & CI/CD](docs/NSIGHT_AUTOMATED_PROFILING_GUIDE_PART2.md)
+- **[Advanced Profiling Guide](docs/ADVANCED_PROFILING_GUIDE.md)** - Comprehensive guide covering:
   - CUDA Graph modes (FULL, PIECEWISE, NONE, etc.) explained
   - Forward pass timing with minimal overhead
   - Scheduling efficiency metrics
   - Prefill/decode breakup analysis
   - GPU bandwidth estimation
   - Impact of max_model_len on performance
+- **[MoE Expert Tracking & MFU Guide](docs/MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md)** - MoE profiling and metrics reliability:
+  - MoE expert activation tracking (existing support + custom implementation)
+  - MFU (Model FLOPs Utilization) metrics reliability analysis
+  - How analytical metrics work and their accuracy (95% for dense, 70-90% for MoE)
+  - sitecustomize.py implementation for expert tracking
+  - Load balancing analysis and expert utilization patterns
 - **[KV Cache Guide](docs/KV_CACHE_GUIDE.md)**: Deep dive into KV cache architecture
 - **[CUDA Graphs Guide](docs/CUDA_GRAPHS.md)**: CUDA graph metrics and tracking
 

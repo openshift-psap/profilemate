@@ -10,6 +10,9 @@
 6. [GPU Bandwidth Estimation](#gpu-bandwidth-estimation)
 7. [Impact of max_model_len on Performance](#impact-of-max_model_len-on-performance)
 
+**See Also**:
+- [MoE Expert Tracking & MFU Guide](MOE_EXPERT_TRACKING_AND_MFU_GUIDE.md) - For MoE-specific profiling and MFU metrics reliability
+
 ---
 
 ## 1. CUDA Graph Metrics
