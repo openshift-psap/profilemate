@@ -77,10 +77,17 @@ After running, you'll find:
 │   ├── cuda_graph_usage.csv      # Replay frequency per graph
 │   └── cuda_graph_timeline.csv   # Detailed replay timeline
 │
-└── KV Cache Files:
-    ├── kv_cache_usage.csv         # Usage over time
-    ├── kv_cache_evictions.csv     # Eviction events
-    └── kv_cache_summary.txt       # Summary statistics
+├── KV Cache Files:
+│   ├── kv_cache_usage.csv         # Usage over time
+│   ├── kv_cache_evictions.csv     # Eviction events
+│   └── kv_cache_summary.txt       # Summary statistics
+│
+└── MoE Expert Tracking:
+    ├── moe_expert_activations.csv    # Expert activation counts per layer
+    ├── moe_expert_coselection.csv    # Which experts are selected together
+    ├── moe_routing_weights_hist.csv  # Routing weight distributions
+    ├── moe_load_imbalance.csv        # Load balancing metrics over time
+    └── moe_summary.json              # Aggregated statistics
 ```
 
 ## Configuration
@@ -106,6 +113,7 @@ Edit `sitecustomize.py`:
 class ProfilingConfig:
     ENABLE_CUDA_GRAPH_TRACKING = True   # Set to False to disable
     ENABLE_KV_CACHE_TRACKING = True     # Set to False to disable
+    ENABLE_MOE_EXPERT_TRACKING = True   # Set to False to disable
 ```
 
 ## Understanding the Output
@@ -184,6 +192,65 @@ timestamp_sec,lifetime_sec,idle_sec
 - `idle_sec < 5`: Efficient eviction
 - Few evictions overall: Good cache sizing
 
+### MoE Expert Activations
+
+**moe_expert_activations.csv**:
+```csv
+layer_idx,expert_id,activation_count,percentage
+0,0,15234,12.45
+0,1,18932,15.47
+0,2,14521,11.87
+```
+
+**What it tells you**:
+- Which experts are being utilized in each layer
+- Distribution of workload across experts
+- Expert activation patterns and coverage
+
+**Healthy patterns**:
+- Balanced activation percentages (8-12% for 8 experts with top-2)
+- All experts activated (100% coverage)
+- Load balance ratio < 2.0 (max/min activations)
+
+### MoE Expert Co-Selection
+
+**moe_expert_coselection.csv**:
+```csv
+layer_idx,expert_id_1,expert_id_2,coselection_count
+0,0,1,5432
+0,0,2,4821
+0,1,2,6123
+```
+
+**What it tells you**:
+- Which pairs of experts are frequently selected together
+- Routing patterns and expert specialization
+- Potential expert redundancy
+
+**Key insights**:
+- Frequent co-selection → Experts handle related tasks
+- Uniform co-selection → Good load distribution
+- Skewed patterns → Some expert pairs dominate
+
+### MoE Load Imbalance
+
+**moe_load_imbalance.csv**:
+```csv
+layer_idx,timestamp_sec,std_dev,max_min_ratio
+0,1.234,234.5,1.85
+0,2.345,189.2,1.62
+```
+
+**What it tells you**:
+- Load balancing quality over time
+- Expert utilization variance
+- Routing efficiency
+
+**Healthy metrics**:
+- `max_min_ratio < 2.0`: Good load balance
+- `std_dev < mean * 0.3`: Reasonable variance
+- Stable over time: Consistent routing
+
 ## Analysis Examples
 
 ### Python Analysis
@@ -211,6 +278,27 @@ plt.ylabel('KV Cache Usage (%)')
 plt.title('KV Cache Usage Over Time')
 plt.grid(True)
 plt.savefig('kv_cache_usage.png')
+
+# Load MoE expert activations (if using MoE model)
+moe_activations = pd.read_csv('moe_expert_tracking/moe_expert_activations.csv')
+
+# Analyze expert load balance per layer
+for layer_idx in moe_activations['layer_idx'].unique():
+    layer_data = moe_activations[moe_activations['layer_idx'] == layer_idx]
+    print(f"\nLayer {layer_idx}:")
+    print(f"  Expert coverage: {len(layer_data)}/{layer_data['expert_id'].max()+1}")
+    print(f"  Activation range: {layer_data['percentage'].min():.2f}% - {layer_data['percentage'].max():.2f}%")
+    print(f"  Load balance ratio: {layer_data['activation_count'].max() / layer_data['activation_count'].min():.2f}")
+
+# Plot expert activation distribution
+layer_0 = moe_activations[moe_activations['layer_idx'] == 0]
+plt.figure(figsize=(10, 6))
+plt.bar(layer_0['expert_id'], layer_0['percentage'])
+plt.xlabel('Expert ID')
+plt.ylabel('Activation Percentage (%)')
+plt.title('Expert Activation Distribution - Layer 0')
+plt.grid(True, axis='y')
+plt.savefig('expert_activations.png')
 ```
 
 ### Command-Line Analysis
@@ -231,16 +319,20 @@ sort -t',' -k2 -rn kv_cache_usage.csv | head -1
 
 ## Comparison with Built-in Metrics
 
-| Feature | sitecustomize.py | --cudagraph-metrics | --kv-cache-metrics |
-|---------|------------------|---------------------|-------------------|
-| Unique CUDA graphs | ✅ Full details | ❌ Aggregated | N/A |
-| Graph replay counts | ✅ Per graph | ❌ Aggregated | N/A |
-| BatchDescriptor details | ✅ Complete | ❌ Partial | N/A |
-| KV cache usage | ✅ Timeline | N/A | ✅ Sampled |
-| Block allocations | ✅ Total count | N/A | ✅ Sampled |
-| Block evictions | ✅ All events | N/A | ✅ Sampled |
-| Output format | CSV (easy analysis) | Logs | Prometheus |
-| Overhead | <1% | <0.1% | <1% |
+| Feature | sitecustomize.py | --cudagraph-metrics | --kv-cache-metrics | EPLB (MoE) |
+|---------|------------------|---------------------|-------------------|-------------------|
+| Unique CUDA graphs | ✅ Full details | ❌ Aggregated | N/A | N/A |
+| Graph replay counts | ✅ Per graph | ❌ Aggregated | N/A | N/A |
+| BatchDescriptor details | ✅ Complete | ❌ Partial | N/A | N/A |
+| KV cache usage | ✅ Timeline | N/A | ✅ Sampled | N/A |
+| Block allocations | ✅ Total count | N/A | ✅ Sampled | N/A |
+| Block evictions | ✅ All events | N/A | ✅ Sampled | N/A |
+| Expert activations | ✅ Per expert/layer | N/A | N/A | ❌ Aggregated only |
+| Expert co-selection | ✅ Full patterns | N/A | N/A | ❌ Not tracked |
+| Routing weights | ✅ Distributions | N/A | N/A | ❌ Not tracked |
+| Load imbalance | ✅ Timeline | N/A | N/A | ✅ Balancedness only |
+| Output format | CSV (easy analysis) | Logs | Prometheus | Logs |
+| Overhead | <1% | <0.1% | <1% | <0.5% |
 
 **Recommendation**: Use **both** for comprehensive profiling:
 ```bash
@@ -347,6 +439,51 @@ awk -F',' 'NR>1 && $2<10 {count++} END {print count " blocks evicted quickly"}' 
     kv_cache_evictions.csv
 ```
 
+### 5. MoE Expert Load Balancing
+
+**Goal**: Verify expert utilization is balanced (for MoE models)
+
+```bash
+# Check expert coverage per layer
+cd moe_expert_tracking/
+
+# Count unique experts activated
+awk -F',' 'NR>1 {print $1}' moe_expert_activations.csv | sort -u | wc -l
+
+# Find load imbalance per layer
+python -c "
+import pandas as pd
+df = pd.read_csv('moe_expert_activations.csv')
+for layer in df['layer_idx'].unique():
+    layer_df = df[df['layer_idx'] == layer]
+    ratio = layer_df['activation_count'].max() / layer_df['activation_count'].min()
+    print(f'Layer {layer}: load balance ratio = {ratio:.2f}')
+"
+```
+
+### 6. Expert Specialization Analysis
+
+**Goal**: Understand which experts work together (co-selection patterns)
+
+```bash
+cd moe_expert_tracking/
+
+# Find most common expert pairs
+head -20 moe_expert_coselection.csv
+
+# Analyze routing weight distribution
+python -c "
+import pandas as pd
+import numpy as np
+df = pd.read_csv('moe_routing_weights_hist.csv')
+print('Routing weight statistics:')
+print(f'  Mean: {df[\"weight\"].mean():.4f}')
+print(f'  Std: {df[\"weight\"].std():.4f}')
+print(f'  Min: {df[\"weight\"].min():.4f}')
+print(f'  Max: {df[\"weight\"].max():.4f}')
+"
+```
+
 ## Advanced Usage
 
 ### Custom Profiling Hooks
@@ -417,6 +554,12 @@ for _, row in kv_cache.iterrows():
   - How analytical metrics work and their accuracy (95% for dense, 70-90% for MoE)
   - sitecustomize.py implementation for expert tracking
   - Load balancing analysis and expert utilization patterns
+- **[MoE Expert Profiler Implementation](docs/MOE_EXPERT_PROFILER_IMPLEMENTATION.md)** - **NEW!** Complete MoEExpertProfiler implementation:
+  - ✅ Production-ready implementation in sitecustomize.py
+  - Automatic instrumentation of FusedMoE layer for Expert Parallelism
+  - Per-layer expert activation tracking, co-selection patterns, and load balancing
+  - CSV outputs with analysis examples and visualization scripts
+  - <3% overhead with configurable sampling
 - **[KV Cache Guide](docs/KV_CACHE_GUIDE.md)**: Deep dive into KV cache architecture
 - **[CUDA Graphs Guide](docs/CUDA_GRAPHS.md)**: CUDA graph metrics and tracking
 

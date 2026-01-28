@@ -45,6 +45,8 @@ Automated profiling scripts for vLLM using Nsight Systems and Nsight Compute.
 
 **MoE mode** (with expert tracking):
 ```bash
+# Requires sitecustomize.py to be in PYTHONPATH for expert tracking
+export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
 ./profile_vllm.sh --model Qwen/Qwen2.5-MoE-72B --mode moe
 ```
 
@@ -271,10 +273,12 @@ profiling_results_TIMESTAMP/
 │   ├── kernel_bandwidth_metrics.csv
 │   ├── roofline_data.csv
 │   └── ncu_summary.json
-├── moe_expert_tracking/                # MoE tracking (if mode=moe)
-│   ├── moe_expert_activations.csv
-│   ├── moe_expert_coselection.csv
-│   └── moe_routing_weights_hist.csv
+├── moe_expert_tracking/                # MoE tracking (if mode=moe and PYTHONPATH set)
+│   ├── moe_expert_activations.csv      # Expert activation counts per layer
+│   ├── moe_expert_coselection.csv      # Expert co-selection patterns
+│   ├── moe_routing_weights_hist.csv    # Routing weight distributions
+│   ├── moe_load_imbalance.csv          # Load balancing over time
+│   └── moe_summary.json                # Aggregated MoE statistics
 └── profile_report.html                 # Comprehensive report
 ```
 
@@ -403,6 +407,50 @@ ncu --set full \
     --launch-skip 50 --launch-count 10 \
     --output ./detailed.ncu-rep \
     <vllm command>
+```
+
+### Example 4: MoE Expert Load Balancing Analysis
+
+```bash
+# Profile MoE model with expert tracking
+export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+./profile_vllm.sh --model Qwen/Qwen2.5-MoE-72B --mode moe
+
+# Navigate to MoE tracking directory
+cd profiling_results_*/moe_expert_tracking/
+
+# Check expert activation coverage
+python -c "
+import json
+with open('moe_summary.json') as f:
+    summary = json.load(f)
+    for layer, stats in summary.items():
+        print(f\"{layer}:\")
+        print(f\"  Coverage: {stats['activation_coverage_pct']:.1f}%\")
+        print(f\"  Load balance: {stats['load_balance_ratio']:.2f}\")
+        print(f\"  Unique experts: {stats['unique_experts_activated']}/{stats['num_experts']}\")
+"
+
+# Find most imbalanced layers
+python -c "
+import pandas as pd
+df = pd.read_csv('moe_load_imbalance.csv')
+# Get average imbalance per layer
+avg_imbalance = df.groupby('layer_idx')['max_min_ratio'].mean()
+print('Most imbalanced layers:')
+print(avg_imbalance.sort_values(ascending=False).head(5))
+"
+
+# Analyze expert co-selection patterns
+python -c "
+import pandas as pd
+df = pd.read_csv('moe_expert_coselection.csv')
+# Find top co-selection pairs for layer 0
+layer_0 = df[df['layer_idx'] == 0].nlargest(10, 'coselection_count')
+print('Top 10 expert pairs (Layer 0):')
+for _, row in layer_0.iterrows():
+    print(f\"  ({row['expert_id_1']}, {row['expert_id_2']}): {row['coselection_count']} times\")
+"
 ```
 
 ---

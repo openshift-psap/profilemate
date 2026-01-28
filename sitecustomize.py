@@ -2,11 +2,12 @@
 vLLM Comprehensive Runtime Instrumentation
 ==========================================
 
-Captures CUDA graph and KV cache metrics during vLLM server runtime.
+Captures CUDA graph, KV cache, and MoE expert metrics during vLLM server runtime.
 
 Features:
 - CUDA graph usage tracking with full BatchDescriptor details
 - KV cache allocation, usage, and eviction metrics
+- MoE expert activation patterns and load balancing analysis
 - Block pool statistics
 - Automatic CSV export with detailed analysis
 
@@ -18,7 +19,11 @@ Output Location:
     /tmp/vllm_profiling/session_<timestamp>/
         - cuda_graph_usage.csv
         - kv_cache_stats.csv
-        - block_allocations.csv
+        - moe_expert_tracking/
+            - moe_expert_activations.csv
+            - moe_expert_coselection.csv
+            - moe_routing_weights_hist.csv
+            - moe_load_imbalance.csv
         - summary.txt
 """
 
@@ -43,6 +48,7 @@ class ProfilingConfig:
     LOG_INTERVAL = int(os.getenv("VLLM_PROFILING_LOG_INTERVAL", "100"))
     ENABLE_CUDA_GRAPH_TRACKING = True
     ENABLE_KV_CACHE_TRACKING = True
+    ENABLE_MOE_EXPERT_TRACKING = True
     VERBOSE = os.getenv("VLLM_PROFILING_VERBOSE", "0") == "1"
 
 
@@ -232,6 +238,174 @@ class KVCacheProfiler:
         print(f"  - Peak usage: {self.stats['peak_blocks']} blocks")
 
 
+class MoEExpertProfiler:
+    """Profiles MoE expert activations and routing patterns"""
+
+    def __init__(self, session_dir: str):
+        self.session_dir = session_dir
+        self.stats = {
+            'expert_activations': defaultdict(lambda: defaultdict(int)),  # {layer_idx: {expert_id: count}}
+            'routing_weights': [],  # (layer_idx, token_idx, expert_id, weight)
+            'co_selection_patterns': defaultdict(lambda: defaultdict(int)),  # {layer_idx: {(expert1, expert2): count}}
+            'expert_load_imbalance': [],  # (layer_idx, timestamp, std_dev, max_min_ratio)
+        }
+        self.start_time = time.time()
+        self.num_experts_per_layer = {}  # {layer_idx: num_experts}
+        self.top_k = {}  # {layer_idx: top_k value}
+        self.sample_count = 0
+        self.log_interval = ProfilingConfig.LOG_INTERVAL
+
+    def record_expert_selection(
+        self,
+        layer_idx: int,
+        topk_ids: Any,  # Tensor of shape [num_tokens, top_k]
+        topk_weights: Any,  # Tensor of shape [num_tokens, top_k]
+        num_experts: int,
+        top_k: int
+    ):
+        """Record expert selection for a layer"""
+        import torch
+
+        self.sample_count += 1
+
+        # Store layer configuration
+        if layer_idx not in self.num_experts_per_layer:
+            self.num_experts_per_layer[layer_idx] = num_experts
+            self.top_k[layer_idx] = top_k
+
+        # Convert to CPU numpy for analysis
+        if isinstance(topk_ids, torch.Tensor):
+            topk_ids_np = topk_ids.detach().cpu().numpy()
+            topk_weights_np = topk_weights.detach().cpu().numpy()
+        else:
+            topk_ids_np = topk_ids
+            topk_weights_np = topk_weights
+
+        num_tokens = topk_ids_np.shape[0]
+
+        # Track expert activations
+        expert_counts = defaultdict(int)
+        for token_idx in range(num_tokens):
+            for k_idx in range(top_k):
+                expert_id = int(topk_ids_np[token_idx, k_idx])
+                weight = float(topk_weights_np[token_idx, k_idx])
+
+                # Count activations
+                self.stats['expert_activations'][layer_idx][expert_id] += 1
+                expert_counts[expert_id] += 1
+
+                # Sample routing weights (not all tokens to save memory)
+                if self.sample_count % self.log_interval == 0:
+                    self.stats['routing_weights'].append(
+                        (layer_idx, token_idx, expert_id, weight)
+                    )
+
+                # Track co-selection patterns (which experts are selected together)
+                if k_idx > 0:
+                    prev_expert = int(topk_ids_np[token_idx, k_idx - 1])
+                    co_key = tuple(sorted([prev_expert, expert_id]))
+                    self.stats['co_selection_patterns'][layer_idx][co_key] += 1
+
+        # Calculate load imbalance for this batch
+        if expert_counts:
+            counts = list(expert_counts.values())
+            if len(counts) > 1:
+                import numpy as np
+                std_dev = float(np.std(counts))
+                max_min_ratio = max(counts) / max(min(counts), 1)
+                self.stats['expert_load_imbalance'].append(
+                    (layer_idx, time.time() - self.start_time, std_dev, max_min_ratio)
+                )
+
+        if ProfilingConfig.VERBOSE and self.sample_count % self.log_interval == 0:
+            unique_experts = len(expert_counts)
+            print(f"[MoE Expert] Layer {layer_idx}: {unique_experts}/{num_experts} experts activated",
+                  file=sys.stderr)
+
+    def save_stats(self):
+        """Save MoE expert tracking statistics"""
+        import numpy as np
+
+        moe_dir = os.path.join(self.session_dir, "moe_expert_tracking")
+        os.makedirs(moe_dir, exist_ok=True)
+
+        # Expert activations per layer
+        activations_file = os.path.join(moe_dir, "moe_expert_activations.csv")
+        with open(activations_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['layer_idx', 'expert_id', 'activation_count', 'percentage'])
+
+            for layer_idx in sorted(self.stats['expert_activations'].keys()):
+                expert_counts = self.stats['expert_activations'][layer_idx]
+                total_activations = sum(expert_counts.values())
+
+                for expert_id in sorted(expert_counts.keys()):
+                    count = expert_counts[expert_id]
+                    pct = (count / total_activations * 100) if total_activations > 0 else 0
+                    writer.writerow([layer_idx, expert_id, count, f"{pct:.2f}"])
+
+        # Co-selection patterns
+        coselection_file = os.path.join(moe_dir, "moe_expert_coselection.csv")
+        with open(coselection_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['layer_idx', 'expert_id_1', 'expert_id_2', 'coselection_count'])
+
+            for layer_idx in sorted(self.stats['co_selection_patterns'].keys()):
+                patterns = self.stats['co_selection_patterns'][layer_idx]
+                for (exp1, exp2), count in sorted(patterns.items(), key=lambda x: x[1], reverse=True):
+                    writer.writerow([layer_idx, exp1, exp2, count])
+
+        # Routing weights histogram (sampled)
+        if self.stats['routing_weights']:
+            weights_file = os.path.join(moe_dir, "moe_routing_weights_hist.csv")
+            with open(weights_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['layer_idx', 'token_idx', 'expert_id', 'weight'])
+                for layer_idx, token_idx, expert_id, weight in self.stats['routing_weights']:
+                    writer.writerow([layer_idx, token_idx, expert_id, f"{weight:.6f}"])
+
+        # Load imbalance timeline
+        if self.stats['expert_load_imbalance']:
+            imbalance_file = os.path.join(moe_dir, "moe_load_imbalance.csv")
+            with open(imbalance_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['layer_idx', 'timestamp_sec', 'std_dev', 'max_min_ratio'])
+                for layer_idx, ts, std_dev, ratio in self.stats['expert_load_imbalance']:
+                    writer.writerow([layer_idx, f"{ts:.3f}", f"{std_dev:.3f}", f"{ratio:.3f}"])
+
+        # Summary statistics
+        summary_file = os.path.join(moe_dir, "moe_summary.json")
+        summary = {}
+
+        for layer_idx in sorted(self.stats['expert_activations'].keys()):
+            expert_counts = self.stats['expert_activations'][layer_idx]
+            counts_array = np.array(list(expert_counts.values()))
+            total_activations = sum(expert_counts.values())
+            num_experts = self.num_experts_per_layer.get(layer_idx, len(expert_counts))
+
+            summary[f"layer_{layer_idx}"] = {
+                'num_experts': num_experts,
+                'top_k': self.top_k.get(layer_idx, 2),
+                'total_activations': int(total_activations),
+                'unique_experts_activated': len(expert_counts),
+                'activation_coverage_pct': (len(expert_counts) / num_experts * 100) if num_experts > 0 else 0,
+                'mean_activations_per_expert': float(np.mean(counts_array)),
+                'std_dev_activations': float(np.std(counts_array)),
+                'min_activations': int(np.min(counts_array)),
+                'max_activations': int(np.max(counts_array)),
+                'load_balance_ratio': float(np.max(counts_array) / max(np.min(counts_array), 1)),
+            }
+
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        print(f"\n[MoE Expert Profiler] Saved statistics to {moe_dir}/")
+        print(f"  - Layers tracked: {len(self.stats['expert_activations'])}")
+        total_unique_experts = sum(len(experts) for experts in self.stats['expert_activations'].values())
+        print(f"  - Total unique expert activations: {total_unique_experts}")
+        print(f"  - Routing weight samples: {len(self.stats['routing_weights'])}")
+
+
 # ============================================================================
 # Global Profiler Instances
 # ============================================================================
@@ -242,6 +416,7 @@ os.makedirs(_session_dir, exist_ok=True)
 
 _cuda_profiler = CUDAGraphProfiler(_session_dir) if ProfilingConfig.ENABLE_CUDA_GRAPH_TRACKING else None
 _kv_profiler = KVCacheProfiler(_session_dir) if ProfilingConfig.ENABLE_KV_CACHE_TRACKING else None
+_moe_profiler = MoEExpertProfiler(_session_dir) if ProfilingConfig.ENABLE_MOE_EXPERT_TRACKING else None
 
 
 def save_all_stats():
@@ -250,6 +425,8 @@ def save_all_stats():
         _cuda_profiler.save_stats()
     if _kv_profiler:
         _kv_profiler.save_stats()
+    if _moe_profiler:
+        _moe_profiler.save_stats()
 
     # Write metadata
     metadata_file = os.path.join(_session_dir, "metadata.json")
@@ -260,6 +437,7 @@ def save_all_stats():
             'output_dir': _session_dir,
             'cuda_graph_tracking': ProfilingConfig.ENABLE_CUDA_GRAPH_TRACKING,
             'kv_cache_tracking': ProfilingConfig.ENABLE_KV_CACHE_TRACKING,
+            'moe_expert_tracking': ProfilingConfig.ENABLE_MOE_EXPERT_TRACKING,
         }, f, indent=2)
 
 
@@ -402,6 +580,73 @@ def patch_block_pool():
         print(f"[Instrumentation] Failed to patch BlockPool: {e}", file=sys.stderr)
 
 
+def patch_fused_moe():
+    """Patch FusedMoE layer to track expert activations"""
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+
+        # Store original forward method
+        original_forward = FusedMoE.forward
+
+        def instrumented_forward(self, hidden_states):
+            """Instrumented forward pass with expert tracking"""
+            # Call original forward to get router logits and expert selection
+            # We need to intercept the router output before it goes to the experts
+
+            # Get router outputs first
+            if hasattr(self, 'gate') or hasattr(self, 'router'):
+                router = getattr(self, 'gate', None) or getattr(self, 'router', None)
+
+                if router is not None:
+                    import torch
+
+                    # Get router logits
+                    router_logits = router(hidden_states)
+
+                    # Get top-k selection
+                    top_k = getattr(self, 'top_k', 2)
+                    num_experts = getattr(self, 'num_experts', router_logits.shape[-1])
+
+                    # Calculate routing weights and expert IDs
+                    routing_weights = torch.softmax(router_logits, dim=-1)
+                    topk_weights, topk_ids = torch.topk(routing_weights, top_k, dim=-1)
+
+                    # Normalize weights
+                    if hasattr(self, 'normalize_expert_weights'):
+                        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+                    # Track expert selection if profiler is enabled
+                    if _moe_profiler:
+                        layer_idx = getattr(self, 'layer_idx', -1)
+
+                        # If layer_idx not set, try to infer from self
+                        if layer_idx == -1 and hasattr(self, 'layer_id'):
+                            layer_idx = self.layer_id
+
+                        _moe_profiler.record_expert_selection(
+                            layer_idx=layer_idx,
+                            topk_ids=topk_ids,
+                            topk_weights=topk_weights,
+                            num_experts=num_experts,
+                            top_k=top_k
+                        )
+
+            # Call original forward
+            return original_forward(self, hidden_states)
+
+        FusedMoE.forward = instrumented_forward
+
+        logger.info("[Instrumentation] Successfully patched FusedMoE")
+
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[Instrumentation] Failed to patch FusedMoE: {e}", file=sys.stderr)
+
+
 # ============================================================================
 # Import Hook Installation
 # ============================================================================
@@ -420,6 +665,7 @@ def install_import_hook():
                 'vllm.compilation.cuda_graph',
                 'vllm.v1.core.kv_cache_manager',
                 'vllm.v1.core.block_pool',
+                'vllm.model_executor.layers.fused_moe.layer',
             ]
 
             if fullname in target_modules:
@@ -442,6 +688,8 @@ def install_import_hook():
                 patch_kv_cache_manager()
             elif fullname == 'vllm.v1.core.block_pool':
                 patch_block_pool()
+            elif fullname == 'vllm.model_executor.layers.fused_moe.layer':
+                patch_fused_moe()
 
             return module
 
@@ -461,4 +709,5 @@ print(f"  Session ID: {_session_id}", file=sys.stderr)
 print(f"  Output directory: {_session_dir}", file=sys.stderr)
 print(f"  CUDA graph tracking: {ProfilingConfig.ENABLE_CUDA_GRAPH_TRACKING}", file=sys.stderr)
 print(f"  KV cache tracking: {ProfilingConfig.ENABLE_KV_CACHE_TRACKING}", file=sys.stderr)
+print(f"  MoE expert tracking: {ProfilingConfig.ENABLE_MOE_EXPERT_TRACKING}", file=sys.stderr)
 print("", file=sys.stderr)
