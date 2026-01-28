@@ -364,8 +364,20 @@ for _, row in kv_cache.iterrows():
 
 ## Documentation
 
-- **[KV_CACHE_GUIDE.md](KV_CACHE_GUIDE.md)**: Deep dive into KV cache architecture
-- **[CUDA_GRAPHS.md](CUDA_GRAPHS.md)**: CUDA graph metrics and tracking
+### Guides
+
+- **[Advanced Profiling Guide](docs/ADVANCED_PROFILING_GUIDE.md)** - **NEW!** Comprehensive guide covering:
+  - CUDA Graph modes (FULL, PIECEWISE, NONE, etc.) explained
+  - Forward pass timing with minimal overhead
+  - Scheduling efficiency metrics
+  - Prefill/decode breakup analysis
+  - GPU bandwidth estimation
+  - Impact of max_model_len on performance
+- **[KV Cache Guide](docs/KV_CACHE_GUIDE.md)**: Deep dive into KV cache architecture
+- **[CUDA Graphs Guide](docs/CUDA_GRAPHS.md)**: CUDA graph metrics and tracking
+
+### Source Code
+
 - **[sitecustomize.py](sitecustomize.py)**: Source code with inline comments
 
 ## Contributing

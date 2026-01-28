@@ -4,6 +4,13 @@
 
 This document captures findings about CUDA graph usage tracking in vLLM, including built-in metrics, limitations, and workarounds for detailed tracking.
 
+**See also**: [Advanced Profiling Guide](ADVANCED_PROFILING_GUIDE.md) for comprehensive profiling strategies including:
+- Forward pass timing
+- Scheduling efficiency metrics
+- Prefill/decode breakup analysis
+- GPU bandwidth estimation
+- Impact of max_model_len on performance
+
 ## Table of Contents
 
 - [CUDA Graph Metrics Support](#cuda-graph-metrics-support)
