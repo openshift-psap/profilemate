@@ -61,7 +61,10 @@ class ProfilingConfig:
     USE_CUDA_EVENTS = True  # Set False to use lightweight timing
     CUDA_EVENT_BATCH_SIZE = 100  # Sync every N iterations (only if USE_CUDA_EVENTS=True)
 
+    # Debug logging
     VERBOSE = os.getenv("VLLM_PROFILING_VERBOSE", "0") == "1"
+    DEBUG = os.getenv("VLLM_PROFILING_DEBUG", "0") == "1"  # Extra verbose logging
+    DEBUG_INTERVAL = int(os.getenv("VLLM_PROFILING_DEBUG_INTERVAL", "1"))  # Log every N events in debug mode
 
 
 # ============================================================================
@@ -85,8 +88,9 @@ class CUDAGraphProfiler:
         key = f"{runtime_mode}:{batch_descriptor}"
         self.stats['graphs_captured'][key] = time.time() - self.start_time
 
-        if ProfilingConfig.VERBOSE:
-            print(f"[CUDA Graph] Captured: {key}", file=sys.stderr)
+        if ProfilingConfig.DEBUG or ProfilingConfig.VERBOSE:
+            print(f"[CUDA Graph] ✅ CAPTURED: {key}", file=sys.stderr)
+            print(f"  Total unique graphs: {len(self.stats['graphs_captured'])}", file=sys.stderr)
 
     def record_replay(self, batch_descriptor: str, runtime_mode: str, duration: float = 0):
         """Record CUDA graph replay event"""
@@ -95,6 +99,10 @@ class CUDAGraphProfiler:
         self.stats['replay_times'].append(
             (time.time() - self.start_time, key, duration)
         )
+
+        total_replays = sum(self.stats['graph_replays'].values())
+        if ProfilingConfig.DEBUG and total_replays % ProfilingConfig.DEBUG_INTERVAL == 0:
+            print(f"[CUDA Graph] 🔄 REPLAY #{total_replays}: {key} ({duration*1000:.2f}ms)", file=sys.stderr)
 
     def save_stats(self):
         """Save CUDA graph statistics"""
@@ -940,6 +948,16 @@ _batch_util_profiler = BatchUtilizationProfiler(_session_dir) if ProfilingConfig
 _preemption_profiler = PreemptionProfiler(_session_dir) if ProfilingConfig.ENABLE_PREEMPTION_TRACKING else None
 _encoder_decoder_profiler = EncoderDecoderProfiler(_session_dir) if ProfilingConfig.ENABLE_ENCODER_DECODER_TIMING else None
 
+# Track patch status for diagnostics
+_patch_status = {
+    'CUDAGraphWrapper': False,
+    'KVCacheManager': False,
+    'BlockPool': False,
+    'FusedMoE': False,
+    'GPUModelRunner': False,
+    'Scheduler': False,
+}
+
 
 def save_all_stats():
     """Save all profiling statistics on exit"""
@@ -982,6 +1000,30 @@ def save_all_stats():
 atexit.register(save_all_stats)
 
 
+def print_patch_diagnostics():
+    """Print diagnostic information about patch status"""
+    if not (ProfilingConfig.DEBUG or ProfilingConfig.VERBOSE):
+        return
+
+    print("\n" + "="*60, file=sys.stderr)
+    print("ProfileMate Patch Diagnostics", file=sys.stderr)
+    print("="*60, file=sys.stderr)
+
+    for patch_name, status in _patch_status.items():
+        if status is True:
+            print(f"  ✅ {patch_name}: Applied", file=sys.stderr)
+        elif status is False:
+            print(f"  ⏳ {patch_name}: Waiting (will patch when module loads)", file=sys.stderr)
+        elif status == 'NotFound':
+            print(f"  ⚠️  {patch_name}: Module not found", file=sys.stderr)
+        else:
+            print(f"  ❌ {patch_name}: {status}", file=sys.stderr)
+
+    print("\nNote: Patches are applied lazily when vLLM modules are imported.", file=sys.stderr)
+    print("Check logs for '✅ Successfully patched' messages as vLLM initializes.", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
+
+
 # ============================================================================
 # Instrumentation Patches
 # ============================================================================
@@ -1010,6 +1052,8 @@ def patch_cuda_graph_wrapper():
                 # Check if this is a new capture or replay
                 if batch_descriptor not in self.concrete_cudagraph_entries:
                     # About to capture
+                    if ProfilingConfig.DEBUG:
+                        print(f"[CUDA Graph Patch] Capturing new graph: {batch_descriptor}", file=sys.stderr)
                     _cuda_profiler.record_capture(
                         str(batch_descriptor),
                         str(cudagraph_runtime_mode)
@@ -1033,12 +1077,25 @@ def patch_cuda_graph_wrapper():
             return original_call(self, *args, **kwargs)
 
         CUDAGraphWrapper.__call__ = instrumented_call
+
+        _patch_status['CUDAGraphWrapper'] = True
+
+        if ProfilingConfig.DEBUG:
+            print(f"[Instrumentation] ✅ Successfully patched CUDAGraphWrapper", file=sys.stderr)
+            print(f"[Instrumentation]    - Intercepting: CUDAGraphWrapper.__call__", file=sys.stderr)
+            print(f"[Instrumentation]    - Profiler enabled: {_cuda_profiler is not None}", file=sys.stderr)
         logger.info("[Instrumentation] Successfully patched CUDAGraphWrapper")
 
-    except ImportError:
-        pass
+    except ImportError as e:
+        _patch_status['CUDAGraphWrapper'] = 'NotFound'
+        if ProfilingConfig.DEBUG:
+            print(f"[Instrumentation] ⚠️  CUDAGraphWrapper not found (ImportError): {e}", file=sys.stderr)
     except Exception as e:
-        print(f"[Instrumentation] Failed to patch CUDAGraphWrapper: {e}", file=sys.stderr)
+        _patch_status['CUDAGraphWrapper'] = f'Error: {e}'
+        print(f"[Instrumentation] ❌ Failed to patch CUDAGraphWrapper: {e}", file=sys.stderr)
+        if ProfilingConfig.DEBUG:
+            import traceback
+            traceback.print_exc()
 
 
 def patch_kv_cache_manager():
@@ -1492,6 +1549,28 @@ if should_activate_profiling():
     print(f"  Preemption tracking: {ProfilingConfig.ENABLE_PREEMPTION_TRACKING}", file=sys.stderr)
     print(f"  Encoder-decoder timing: {ProfilingConfig.ENABLE_ENCODER_DECODER_TIMING}", file=sys.stderr)
     print(f"  CUDA Events mode: {ProfilingConfig.USE_CUDA_EVENTS} (batch size: {ProfilingConfig.CUDA_EVENT_BATCH_SIZE})", file=sys.stderr)
+    print(f"  Debug mode: {ProfilingConfig.DEBUG}", file=sys.stderr)
+    print(f"  Verbose mode: {ProfilingConfig.VERBOSE}", file=sys.stderr)
+
+    if ProfilingConfig.DEBUG:
+        print("\n[sitecustomize] 🔍 DEBUG MODE ENABLED", file=sys.stderr)
+        print("  You will see detailed logs when events are captured.", file=sys.stderr)
+        print("  Look for messages like:", file=sys.stderr)
+        print("    - ✅ CAPTURED: (new CUDA graph)", file=sys.stderr)
+        print("    - 🔄 REPLAY: (CUDA graph replay)", file=sys.stderr)
+        print("    - ✅ Successfully patched: (module instrumentation)", file=sys.stderr)
+
+    # Print patch diagnostics in debug mode
+    if ProfilingConfig.DEBUG or ProfilingConfig.VERBOSE:
+        import atexit
+        # Schedule diagnostics to print after vLLM modules load
+        def delayed_diagnostics():
+            import time
+            time.sleep(2)  # Wait for vLLM to load
+            print_patch_diagnostics()
+        import threading
+        threading.Thread(target=delayed_diagnostics, daemon=True).start()
+
     print("", file=sys.stderr)
 else:
     # Silent mode - don't activate profiling for non-vLLM processes
