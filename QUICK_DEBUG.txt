@@ -1,0 +1,75 @@
+═══════════════════════════════════════════════════════════════
+ProfileMate Quick Debug Reference
+═══════════════════════════════════════════════════════════════
+
+ENABLE DEBUG MODE:
+  export VLLM_PROFILING_DEBUG=1
+  export VLLM_NO_USAGE_STATS=1
+
+RUN WITH DEBUG:
+  export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+  python -m vllm.entrypoints.openai.api_server \
+      --model facebook/opt-125m \
+      --port 8000 \
+      2>&1 | tee vllm_debug.log
+
+WHAT TO LOOK FOR IN LOGS:
+  ✅ "[sitecustomize] vLLM Comprehensive Instrumentation Loaded"
+     → ProfileMate is active
+
+  ✅ "[Instrumentation] Successfully patched CUDAGraphWrapper"
+     → CUDA graph profiling will work
+
+  ✅ "[CUDA Graph] ✅ CAPTURED: FULL:BatchDescriptor(...)"
+     → New CUDA graph captured
+
+  ✅ "[CUDA Graph] 🔄 REPLAY #1: FULL:... (12.45ms)"
+     → CUDA graph replay detected
+
+CHECK PATCHES APPLIED:
+  grep "Successfully patched" vllm_debug.log
+
+CHECK DATA COLLECTED:
+  ls -lh /tmp/vllm_profiling/session_*/
+  wc -l /tmp/vllm_profiling/session_*/cuda_graph_captures.csv
+
+ANALYZE RESULTS:
+  python3 -c "
+  import pandas as pd
+  import glob
+  session = max(glob.glob('/tmp/vllm_profiling/session_*/'))
+  print(f'Session: {session}')
+  captures = pd.read_csv(f'{session}/cuda_graph_captures.csv')
+  print(f'Unique graphs: {len(captures)}')
+  usage = pd.read_csv(f'{session}/cuda_graph_usage.csv')
+  print(f'Total replays: {usage[\"replay_count\"].sum()}')
+  "
+
+ABOUT VLLM_NO_USAGE_STATS:
+  • Disables vLLM telemetry (anonymous usage stats)
+  • Fixes cpuinfo JSONDecodeError crash
+  • Completely safe - just skips optional feature
+  • NOT related to ProfileMate
+
+TROUBLESHOOTING:
+  Problem: No sitecustomize message
+    → Check: echo $PYTHONPATH
+    → Fix: export PYTHONPATH="/path/to/profilemate:$PYTHONPATH"
+
+  Problem: No "Successfully patched" messages
+    → Check: python3 check_vllm_compatibility.py
+    → vLLM version may be incompatible
+
+  Problem: Zero stats in CSV files
+    → Enable: export VLLM_PROFILING_DEBUG=1
+    → Send test requests
+    → Watch for CAPTURED/REPLAY messages
+
+  Problem: cpuinfo JSONDecodeError
+    → This is vLLM bug, NOT ProfileMate
+    → Fix: export VLLM_NO_USAGE_STATS=1
+
+FULL GUIDE:
+  See: DEBUG_GUIDE.md
+
+═══════════════════════════════════════════════════════════════
