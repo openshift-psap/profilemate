@@ -1048,32 +1048,68 @@ def patch_cuda_graph_wrapper():
             batch_descriptor = forward_context.batch_descriptor
             cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+            # CRITICAL FIX: Always call original function first, then determine capture vs replay
+            # The original function is responsible for creating entries and performing capture/replay
             if batch_descriptor is not None and _cuda_profiler:
-                # Check if this is a new capture or replay
-                if batch_descriptor not in self.concrete_cudagraph_entries:
-                    # About to capture
-                    if ProfilingConfig.DEBUG:
-                        print(f"[CUDA Graph Patch] Capturing new graph: {batch_descriptor}", file=sys.stderr)
-                    _cuda_profiler.record_capture(
-                        str(batch_descriptor),
-                        str(cudagraph_runtime_mode)
-                    )
+                # Check state BEFORE calling original to determine if this will be a capture
+                entry_exists = batch_descriptor in self.concrete_cudagraph_entries
+                was_capture = False
+                
+                if entry_exists:
+                    entry = self.concrete_cudagraph_entries[batch_descriptor]
+                    # If entry exists but cudagraph is None, it's about to capture
+                    was_capture = (entry.cudagraph is None)
                 else:
-                    # Replay
-                    start_time = time.perf_counter()
-                    result = original_call(self, *args, **kwargs)
+                    # Entry doesn't exist, so this will be a capture
+                    was_capture = True
 
-                    if hasattr(torch.cuda, 'synchronize'):
-                        torch.cuda.synchronize()
-                    duration = time.perf_counter() - start_time
+                # Always call original function first - it handles the actual capture/replay
+                start_time = time.perf_counter()
+                result = original_call(self, *args, **kwargs)
+                
+                # Synchronize for accurate timing
+                if hasattr(torch.cuda, 'synchronize'):
+                    torch.cuda.synchronize()
+                duration = time.perf_counter() - start_time
 
-                    _cuda_profiler.record_replay(
-                        str(batch_descriptor),
-                        str(cudagraph_runtime_mode),
-                        duration
-                    )
-                    return result
+                # Now determine what actually happened
+                # After the call, check if entry was created or if cudagraph was set
+                if entry_exists:
+                    entry = self.concrete_cudagraph_entries[batch_descriptor]
+                    # If cudagraph was None before and is now set, it was a capture
+                    if was_capture and entry.cudagraph is not None:
+                        # This was a capture
+                        if ProfilingConfig.DEBUG:
+                            print(f"[CUDA Graph Patch] Captured new graph: {batch_descriptor}", file=sys.stderr)
+                        _cuda_profiler.record_capture(
+                            str(batch_descriptor),
+                            str(cudagraph_runtime_mode)
+                        )
+                    else:
+                        # This was a replay
+                        if ProfilingConfig.DEBUG and duration > 0:
+                            print(f"[CUDA Graph Patch] Replayed graph: {batch_descriptor} ({duration*1000:.2f}ms)", file=sys.stderr)
+                        _cuda_profiler.record_replay(
+                            str(batch_descriptor),
+                            str(cudagraph_runtime_mode),
+                            duration
+                        )
+                else:
+                    # Entry didn't exist before, check if it exists now
+                    if batch_descriptor in self.concrete_cudagraph_entries:
+                        # Entry was created, this was a capture
+                        if ProfilingConfig.DEBUG:
+                            print(f"[CUDA Graph Patch] Captured new graph: {batch_descriptor}", file=sys.stderr)
+                        _cuda_profiler.record_capture(
+                            str(batch_descriptor),
+                            str(cudagraph_runtime_mode)
+                        )
+                    # If entry still doesn't exist, original function didn't use CUDA graphs
+                    # (e.g., runtime_mode mismatch), so don't record anything
 
+                return result
+
+            # If batch_descriptor is None or profiler is disabled, just call original
             return original_call(self, *args, **kwargs)
 
         CUDAGraphWrapper.__call__ = instrumented_call
